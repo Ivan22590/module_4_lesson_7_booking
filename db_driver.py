@@ -20,9 +20,13 @@ CRUD-методами и безопасной параметризацией з�
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import locale
 import os
 import sys
+import types
+import typing
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -50,6 +54,23 @@ _DEFAULTS = {
     "user": "postgres",
     "password": "postgres",
 }
+
+# Соответствие типов полей моделей (models/*.py) и типов колонок PostgreSQL.
+_SQL_TYPES: dict[Any, str] = {
+    int: "INTEGER",
+    float: "DOUBLE PRECISION",
+    str: "TEXT",
+    bool: "BOOLEAN",
+    datetime: "TIMESTAMP",
+    date: "DATE",
+    time: "TIME",
+}
+
+# Оригиналы «союзных» типов: ``Optional[T]`` (typing.Union) и ``T | None``
+# (types.UnionType в Python 3.10+).
+_UNION_ORIGINS = {typing.Union}
+if hasattr(types, "UnionType"):
+    _UNION_ORIGINS.add(types.UnionType)
 
 
 class DatabaseError(Exception):
@@ -83,6 +104,33 @@ def _decode_error(exc: Exception) -> str:
                 continue
         return data.decode("utf-8", errors="replace")
     return str(exc)
+
+
+def _split_optional(annotation: Any) -> tuple[Any, bool]:
+    """Разбирает аннотацию поля модели на базовый тип и признак ``nullable``.
+
+    Для ``int | None`` и ``Optional[int]`` вернёт ``(int, True)``, для ``str`` —
+    ``(str, False)``.
+    """
+    if typing.get_origin(annotation) in _UNION_ORIGINS:
+        args = typing.get_args(annotation)
+        if type(None) in args:
+            rest = tuple(arg for arg in args if arg is not type(None))
+            if len(rest) == 1:
+                return rest[0], True
+    return annotation, False
+
+
+def _column_type(annotation: Any) -> str:
+    """Возвращает SQL-тип колонки PostgreSQL по аннотации поля модели."""
+    base, _ = _split_optional(annotation)
+    try:
+        return _SQL_TYPES[base]
+    except KeyError:
+        raise ValueError(
+            f"Неподдерживаемый тип поля модели: {base!r}. "
+            f"Допустимые типы: {', '.join(t.__name__ for t in _SQL_TYPES)}."
+        ) from None
 
 
 def load_connection_params(env_file: str | os.PathLike | None = None, **overrides: Any) -> dict:
@@ -242,6 +290,85 @@ class Database:
                 sql.SQL("{} {}").format(sql.Identifier(column), sql.SQL(direction))
             )
         return sql.SQL(", ").join(parts)
+
+    # --- DDL --------------------------------------------------------------------
+
+    @staticmethod
+    def _build_create_table(model: Any) -> Any:
+        """Строит ``CREATE TABLE IF NOT EXISTS`` по dataclass-модели.
+
+        :param model: класс или экземпляр модели (``User``, ``Table``,
+            ``Booking``). Имя таблицы берётся из атрибута ``TABLE``.
+
+        Поле ``id`` становится автоинкрементным первичным ключом,
+        ``created_at`` — меткой времени со значением по умолчанию ``NOW()``.
+        Остальные поля получают тип по аннотации; поля с ``None`` в типе
+        создаются как nullable, без ``None`` — как ``NOT NULL``.
+
+        Внешние ключи задаются метаданными поля::
+
+            user_id: int | None = field(
+                default=None, metadata={"references": ("users", "id")}
+            )
+
+        Такое поле получит ограничение ``REFERENCES "users"("id")``.
+        """
+        cls = model if isinstance(model, type) else type(model)
+        table = cls.TABLE
+        hints = typing.get_type_hints(cls)
+
+        columns = []
+        for field in dataclasses.fields(cls):
+            name = field.name
+            if name == "id":
+                columns.append(
+                    sql.SQL("{} SERIAL PRIMARY KEY").format(sql.Identifier(name))
+                )
+                continue
+            if name == "created_at":
+                columns.append(
+                    sql.SQL("{} TIMESTAMP NOT NULL DEFAULT NOW()").format(
+                        sql.Identifier(name)
+                    )
+                )
+                continue
+
+            annotation = hints.get(name, field.type)
+            _, nullable = _split_optional(annotation)
+            column = sql.SQL("{} {}").format(
+                sql.Identifier(name), sql.SQL(_column_type(annotation))
+            )
+            if not nullable:
+                column = column + sql.SQL(" NOT NULL")
+
+            references = field.metadata.get("references")
+            if references:
+                ref_table, ref_column = references
+                column = column + sql.SQL(" REFERENCES {table}({column})").format(
+                    table=sql.Identifier(ref_table),
+                    column=sql.Identifier(ref_column),
+                )
+            columns.append(column)
+
+        return sql.SQL("CREATE TABLE IF NOT EXISTS {table} ({columns})").format(
+            table=sql.Identifier(table),
+            columns=sql.SQL(", ").join(columns),
+        )
+
+    def create_table(self, model: Any) -> None:
+        """Создаёт таблицу модели, если она ещё не существует.
+
+        :param model: класс или экземпляр dataclass-модели из ``models``
+            (``User``, ``Table``, ``Booking``).
+
+        Пример::
+
+            with Database() as db:
+                db.create_table(User)
+                db.create_table(Table)
+                db.create_table(Booking)
+        """
+        self.execute(self._build_create_table(model))
 
     # --- CRUD -------------------------------------------------------------------
 

@@ -1,14 +1,11 @@
-import os, psycopg2
-from dotenv import load_dotenv
-load_dotenv(override=True)
-conn = psycopg2.connect(
-    host=os.getenv("PGHOST"),
-    port=os.getenv("PGPORT"),
-    dbname=os.getenv("PGDATABASE"),
-    user=os.getenv("PGUSER"),
-    password=os.getenv("PGPASSWORD"),
-)
-with conn, conn.cursor() as cur:
-    cur.execute("SELECT id, name, age FROM users;")
-    for row in cur.fetchall():
-        print(row)
+"""Точка входа мини-системы бронирования.
+
+Запускает графический интерфейс на tkinter (пакет ``gui``).
+"""
+
+from __future__ import annotations
+
+from gui.app import main
+
+if __name__ == "__main__":
+    main()
